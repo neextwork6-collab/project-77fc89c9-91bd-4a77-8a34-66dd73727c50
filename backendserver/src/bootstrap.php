@@ -37,12 +37,21 @@ final class DB
     {
         if (self::$pdo) return self::$pdo;
         $c = Config::get('db');
-        self::$pdo = new \PDO(
-            "mysql:host={$c['host']};port={$c['port']};dbname={$c['name']};charset=utf8mb4",
-            $c['user'], $c['pass'],
-            [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION, \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC, \PDO::ATTR_EMULATE_PREPARES => false]
-        );
-        self::$pdo->exec("SET time_zone = '+06:00'");
+        $name = Migrations::databaseName((string) $c['name']);
+        $dsn = "mysql:host={$c['host']};port={$c['port']};charset=utf8mb4";
+        $options = [\PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION, \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC, \PDO::ATTR_EMULATE_PREPARES => false];
+        try {
+            $pdo = new \PDO($dsn . ";dbname={$c['name']}", $c['user'], $c['pass'], $options);
+        } catch (\PDOException $e) {
+            // Only unknown-database errors permit creation; never mask password/host errors.
+            if ((int) ($e->errorInfo[1] ?? 0) !== 1049 || !Config::get('auto_setup', true)) throw $e;
+            $pdo = new \PDO($dsn, $c['user'], $c['pass'], $options);
+            $pdo->exec("CREATE DATABASE IF NOT EXISTS $name CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+            $pdo->exec("USE $name");
+        }
+        $pdo->exec("SET time_zone = '+06:00'");
+        if (Config::get('auto_setup', true)) Migrations::apply($pdo);
+        self::$pdo = $pdo;
         return self::$pdo;
     }
     public static function all(string $sql, array $p = []): array { $s = self::pdo()->prepare($sql); $s->execute($p); return $s->fetchAll(); }

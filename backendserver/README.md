@@ -7,11 +7,17 @@ PHP 8.1+ host with MySQL (e.g. cPanel). No framework, no Composer.
 
 1. Copy `config.example.php` to `config.php` and fill in DB credentials,
    `app_secret` (64+ random chars) and `master_key` (64+ random chars, server-to-server only).
-2. Create the MySQL database and user, then apply the schema:
-   - `database/001_legacy_schema.sql` — legacy tables (old user data imports as-is)
-   - `database/002_lifeos_engine.sql` — commission engine tables
-   (or call `POST /api/master/db/migrate` after step 3)
+2. Start Apache and MySQL in XAMPP. The configured MySQL account must have CREATE permission.
+   On first database access, the API creates the configured database if missing and applies ordered migrations.
+   Existing databases, tables, accounts and settings are preserved. The legacy archive's DROP and sample INSERT statements are never executed by automatic setup.
+   Set `auto_setup` to false for manually provisioned hosting. Signed `POST /api/master/db/migrate` uses the same safe migration runner.
 3. Point the web root (or an Alias) at this folder; `index.php` + `.htaccess` route everything.
+
+For the XAMPP tunnel at `https://deserver.neexthub.site/lifeos/backendserver/`, ensure Apache AllowOverride permits `.htaccess`, PHP 8.1+ has pdo_mysql enabled, and `cors_origins` in the private server config includes the actual app origin. Never allow every origin. `config.php` is not pushed or overwritten.
+
+## Signed remote updates
+
+Set `LIFEOS_MASTER_KEY` securely in the command environment to the server's existing master key, then run `python3 scripts/master-update.py`. It verifies signed connectivity, sends only the setup update files (no config, storage or tests), and calls safe migrations. `--check` only checks connectivity. No private key is stored in source. A failed migration does not roll back database DDL; fix the migration and retry. Back up production data before applying changes.
 
 ## Marketing plan constants (fixed by business plan)
 
