@@ -1,0 +1,47 @@
+{
+  "source": "https://github.com/neextwork1-dotcom/remix-of-remix-of-remix-of-remix-of-remix-of-pixel-perfect-studio",
+  "capabilities": [
+    {
+      "capability": "code and routes",
+      "source": "TanStack Start content website",
+      "outcome": "Copied all 28 content routes; each returns HTTP 200 with page-specific metadata; routing test passes",
+      "status": "verified",
+      "next_action": null
+    },
+    {
+      "capability": "photos and logo",
+      "source": "bundled images",
+      "outcome": "419 original media assets retained; transparent PNG fits top-right on event photos and viewer; desktop/mobile screenshots verified",
+      "status": "verified",
+      "next_action": null
+    },
+    {
+      "capability": "schema and records",
+      "source": "static bundled content; no database call sites",
+      "outcome": "not_applicable",
+      "status": "verified",
+      "next_action": null
+    },
+    {
+      "capability": "auth identities and authorization",
+      "source": "no working local authentication; external member link and display-only login form",
+      "outcome": "preserve source behavior",
+      "status": "source_behavior_preserved",
+      "next_action": "Source login and registration forms are display-only, not a working account system; no credentials or user records exist in source"
+    },
+    {
+      "capability": "external providers, public endpoints, callbacks, webhooks, schedules, secrets",
+      "source": "external links and video embeds only; no provider API call sites",
+      "outcome": "preserve",
+      "status": "preserved_live_destinations_unverified",
+      "next_action": "Existing external links retained; destination services not controlled or live-verified in this migration"
+    },
+    {
+      "capability": "cutover",
+      "source": "unpublished destination",
+      "outcome": "pending",
+      "status": "pending",
+      "next_action": "Publish when requested by user"
+    }
+  ]
+}
