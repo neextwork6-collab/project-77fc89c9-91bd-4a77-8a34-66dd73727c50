@@ -24,7 +24,7 @@ def request(method, path, payload=None):
     message = f"{timestamp}.{method}.{path}.{hashlib.sha256(body).hexdigest()}"
     signature = hmac.new(key.encode(), message.encode(), hashlib.sha256).hexdigest()
     req = urllib.request.Request(BASE + path, data=body if method != "GET" else None, method=method,
-        headers={"Content-Type": "application/json", "X-Master-Ts": timestamp, "X-Master-Sig": signature})
+        headers={"Content-Type": "application/json", "User-Agent": "LifeOS-Master-Updater/1.0", "X-Master-Ts": timestamp, "X-Master-Sig": signature})
     # Never forward the signing headers to another host via redirects.
     class NoRedirect(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
