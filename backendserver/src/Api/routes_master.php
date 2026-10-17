@@ -132,17 +132,7 @@ $router->get('/api/master/db/tables', function () use ($master) {
 
 $router->post('/api/master/db/migrate', function () use ($master) {
     $master();
-    $applied = [];
-    foreach (glob(LIFEOS_ROOT . '/database/*.sql') ?: [] as $file) {
-        $name = basename($file);
-        if (DB::one('SELECT name FROM lo_migrations WHERE name = ?', [$name])) continue;
-        $sql = (string) file_get_contents($file);
-        foreach (array_filter(array_map('trim', explode(';', $sql))) as $stmt) {
-            if ($stmt !== '' && !str_starts_with($stmt, '--')) DB::pdo()->exec($stmt);
-        }
-        DB::run('INSERT INTO lo_migrations (name) VALUES (?)', [$name]);
-        $applied[] = $name;
-    }
+    $applied = \LifeOS\Migrations::apply(DB::pdo());
     MasterAuth::audit('db.migrate', null, true, implode(',', $applied));
     Http::ok(['applied' => $applied]);
 });
