@@ -25,11 +25,33 @@ $master = function () {
 function masterPath(string $rel, bool $forWrite = false): string
 {
     $rel = ltrim(str_replace('\\', '/', $rel), '/');
-    $full = realpath(LIFEOS_ROOT . '/' . $rel) ?: LIFEOS_ROOT . '/' . $rel;
-    $root = realpath(LIFEOS_ROOT);
-    if (!str_starts_with($full, $root . DIRECTORY_SEPARATOR) && $full !== $root) {
+    if (preg_match('/(^|\/)\.\.(\/|$)|:/', $rel) || str_contains($rel, "\0")) {
         throw new HttpError('Path outside server root', 403);
     }
+    $root = realpath(LIFEOS_ROOT);
+    if ($root === false) throw new HttpError('Server root unavailable', 500);
+    $candidate = $root . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+    $parent = $candidate;
+    $suffix = [];
+    while (realpath($parent) === false) {
+        if (is_link($parent)) throw new HttpError('Path outside server root', 403);
+        $suffix[] = basename($parent);
+        $next = dirname($parent);
+        if ($next === $parent) throw new HttpError('Path outside server root', 403);
+        $parent = $next;
+    }
+    $canonical = realpath($parent);
+    $normalize = static fn(string $path): string => str_replace('\\', '/', $path);
+    $rootCheck = rtrim($normalize($root), '/');
+    $parentCheck = rtrim($normalize($canonical), '/');
+    if (DIRECTORY_SEPARATOR === '\\') {
+        $rootCheck = strtolower($rootCheck);
+        $parentCheck = strtolower($parentCheck);
+    }
+    if ($parentCheck !== $rootCheck && !str_starts_with($parentCheck, $rootCheck . '/')) {
+        throw new HttpError('Path outside server root', 403);
+    }
+    $full = $canonical . ($suffix ? DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, array_reverse($suffix)) : '');
     if ($forWrite && basename($full) === 'config.php') throw new HttpError('config.php is protected', 403);
     return $full;
 }

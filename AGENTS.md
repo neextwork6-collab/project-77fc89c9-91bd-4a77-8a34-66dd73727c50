@@ -24,5 +24,6 @@
 - The member API base uses VITE_LIFEOS_API_URL with an external-host fallback; the optional relative development prefix still uses the Vite proxy.
 - PHP database initialization and signed migration requests share Migrations::apply; legacy dump initialization executes additive structure only to preserve existing accounts and avoid destructive resets.
 - Send external PHP updates with scripts/master-update.py using an environment-only HMAC key; never expose privileged deployment through a browser endpoint.
+- Master file paths resolve through their canonical existing ancestor with normalized Windows separators; this permits missing XAMPP files without allowing traversal or symlink escapes.
 - Member profile changes use the existing user_profiles table and locked user row, preserving the source legacy schema rather than replacing it.
 - Fit the member portal through a single measured desktop canvas in the shared MemberShell; scale the whole canvas rather than adding mobile reflow rules, so every page preserves reference proportions.
