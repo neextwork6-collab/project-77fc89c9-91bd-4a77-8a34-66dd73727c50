@@ -111,9 +111,8 @@ $router->get('/api/member/wallet', function () {
     $withdrawn = (float) DB::val("SELECT COALESCE(SUM(amount),0) FROM lo_withdrawals WHERE user_id = ? AND status = 'APPROVED'", [$uid]);
     $pendingWd = (float) DB::val("SELECT COALESCE(SUM(amount),0) FROM lo_withdrawals WHERE user_id = ? AND status = 'PENDING'", [$uid]);
     $cashback = (float) DB::val("SELECT COALESCE(SUM(amount),0) FROM lo_ledger WHERE user_id = ? AND ledger_type = 'CASHBACK' AND status = 'PAID'", [$uid]);
-    $earned = array_sum($ledger);
     Http::ok([
-        'withdrawable' => round($earned - $withdrawn - $pendingWd, 3),
+        'withdrawable' => memberWithdrawable($uid),
         'pending_withdrawal' => $pendingWd,
         'withdrawn' => $withdrawn,
         'cashback_service_only' => $cashback,
@@ -207,15 +206,22 @@ $router->get('/api/member/rank', function () {
 $router->post('/api/member/withdrawals', function () {
     $u = Auth::member();
     $b = Http::body();
-    $amount = (float) ($b['amount'] ?? 0);
+    $amount = round((float) ($b['amount'] ?? 0), 3);
     $min = (float) (DB::val("SELECT v FROM lo_settings WHERE k = 'withdraw_min'") ?: 500);
-    if ($amount < $min) throw new HttpError("Minimum withdrawal is $min");
+    if (!is_finite($amount) || $amount < $min) throw new HttpError("Minimum withdrawal is $min");
     if (empty($b['method']) || empty($b['account_number'])) throw new HttpError('method and account_number required');
     $chargePct = (float) (DB::val("SELECT v FROM lo_settings WHERE k = 'withdraw_charge_pct'") ?: 0);
-    $id = DB::insert(
-        'INSERT INTO lo_withdrawals (user_id, method, account_number, amount, charge) VALUES (?,?,?,?,?)',
-        [(int) $u['id'], $b['method'], $b['account_number'], $amount, round($amount * $chargePct / 100, 3)]
-    );
+    $uid = (int) $u['id'];
+    $id = DB::tx(function () use ($uid, $b, $amount, $chargePct) {
+        // Lock the member so two simultaneous requests cannot both spend the same balance.
+        DB::one('SELECT id FROM users WHERE id = ? FOR UPDATE', [$uid]);
+        $available = memberWithdrawable($uid);
+        if ($amount > $available) throw new HttpError('Insufficient withdrawable balance', 422);
+        return DB::insert(
+            'INSERT INTO lo_withdrawals (user_id, method, account_number, amount, charge) VALUES (?,?,?,?,?)',
+            [$uid, $b['method'], $b['account_number'], $amount, round($amount * $chargePct / 100, 3)]
+        );
+    });
     Http::ok(['withdrawal_id' => $id, 'status' => 'PENDING']);
 });
 

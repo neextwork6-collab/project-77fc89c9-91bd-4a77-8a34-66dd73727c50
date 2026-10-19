@@ -59,7 +59,12 @@ $router->post('/api/admin/activations/{id}/confirm', function ($p) {
     DB::tx(function () use ($p, $status, $ref) {
         $act = DB::one('SELECT * FROM lo_activations WHERE id = ? FOR UPDATE', [(int) $p['id']]);
         if (!$act) throw new HttpError('Activation not found', 404);
-        if ($act['payment_status'] === 'SUCCESS') return; // duplicate notification ignored
+        if (in_array($act['payment_status'], ['CANCELLED', 'REFUNDED'], true)) return; // final states
+        if ($act['payment_status'] === 'SUCCESS') {
+            // Refund/chargeback after success: audited reversal, never deletion.
+            if (in_array($status, ['CANCELLED', 'REFUNDED'], true)) Commission::reverseActivation((int) $p['id'], $status);
+            return; // duplicate SUCCESS notification ignored
+        }
         if ($ref) {
             // Unique payment_ref: same gateway trx can never confirm twice.
             DB::run('UPDATE lo_activations SET payment_ref = ? WHERE id = ?', [$ref, (int) $p['id']]);
