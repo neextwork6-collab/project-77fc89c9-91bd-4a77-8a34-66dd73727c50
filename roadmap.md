@@ -1,5 +1,6 @@
 # Member panel and external server
-- [ ] Audit and repair attached marketing rules: independent bills/one payout, source volume, caps/reserves, inactive contribution, refunds, withdrawals, statements and regression tests; production release requires financial approval.
+- [ ] Audit and repair attached marketing rules: restore wallet balance, verified activation uniqueness, hard caps and inactive blocking; add source volume, allocation/refund audit, idempotent statements and regression tests.
+- [ ] Production financial release: blocked until historical reconciliation and Finance/Admin approval; do not deploy financial changes automatically.
 - [x] Configure the supplied XAMPP tunnel URL and add missing-database automatic setup; setup and secure path tests pass.
 - [x] Send the approved XAMPP setup update through the signed Master API; all five remote files read back identically, with deployment backups preserved.
 - [x] Verify remote database initialization: signed migration and table reads return HTTP 500 with only “Server error”; requires the XAMPP Apache/PHP error log to diagnose.

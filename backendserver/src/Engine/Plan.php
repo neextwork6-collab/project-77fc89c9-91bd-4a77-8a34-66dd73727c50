@@ -13,6 +13,18 @@ final class Plan
     public const GENERATION_POOL = 200.0;
     public const RANK_POOL = 200.0;
     public const MAX_MATCHING_EVENTS = 11;
+    public const DAILY_MATCHING_CAP = 5000.0;
+    public const MATCHING_TOTAL_LIMIT = 299.854;
+
+    public const ALLOCATIONS = ['CASHBACK' => 100, 'REFERRAL' => 200, 'MATCHING' => 300, 'GENERATION' => 200, 'RANK' => 200];
+
+    public static function payout(float $enrollment, float $binary, int $event, float $remainingReserve, float $dailyUsed, float $configuredCap = self::DAILY_MATCHING_CAP): float
+    {
+        $cap = max(0.0, min(self::DAILY_MATCHING_CAP, $configuredCap));
+        // Floor to ledger precision: rounding must never exceed reserve or cap.
+        $amount = max(0.0, min(max($enrollment, $binary), self::matchingAmount($event), $remainingReserve, $cap - $dailyUsed));
+        return floor(($amount + 1e-10) * 1000000) / 1000000;
+    }
 
     /** Generation 1..10 */
     public const GENERATION = [1 => 50, 2 => 30, 3 => 25, 4 => 20, 5 => 18, 6 => 15, 7 => 12, 8 => 10, 9 => 10, 10 => 10];
