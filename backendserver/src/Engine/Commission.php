@@ -8,13 +8,13 @@ use LifeOS\HttpError;
 
 /**
  * Commission engine. Processes one payment-verified activation exactly once:
- * cashback, direct referral, generation bonus, matching bills (enrollment + binary,
- * one selected payout), daily cap, rank pool. All inside one transaction.
+ * cashback, direct referral, generation bonus, matching (enrollment + binary bills,
+ * ONE selected payout per beneficiary event), daily cap, rank pool. One transaction.
  */
 final class Commission
 {
     /**
-     * Marks a PENDING activation SUCCESS and distributes commissions.
+     * Distributes commissions for a SUCCESS activation.
      * Idempotent: an already-processed activation is a no-op.
      */
     public static function processActivation(int $activationId): void
@@ -29,97 +29,121 @@ final class Commission
             $tree = DB::one('SELECT * FROM lo_tree WHERE user_id = ? FOR UPDATE', [$userId]);
             if (!$tree) throw new HttpError('User tree node missing', 500);
 
-            // 1) Create the qualifying sale (one per activation).
             $saleId = DB::insert(
                 'INSERT INTO lo_sales (sale_code, activation_id, user_id) VALUES (?, ?, ?)',
                 [self::code('SALE'), $activationId, $userId]
             );
-
-            // 2) Activate the member.
             DB::run('UPDATE lo_tree SET is_active = 1 WHERE user_id = ?', [$userId]);
 
-            // 3) Service Cashback ৳100 — separate ledger, not withdrawable.
+            // Service Cashback ৳100 — own ledger, never withdrawable/transferable.
             self::ledger('CASHBACK', $userId, Plan::CASHBACK, $activationId, $saleId, null, null, 'Service cashback (service-use only)');
 
-            // 4) Direct Referral ৳200 — direct sponsor only.
+            // Direct Referral ৳200 — direct sponsor only, and only if that sponsor is active.
             $sponsorId = $tree['sponsor_id'] !== null ? (int) $tree['sponsor_id'] : null;
-            if ($sponsorId !== null) {
+            if ($sponsorId !== null && self::isActive($sponsorId)) {
                 self::ledger('REFERRAL', $sponsorId, Plan::REFERRAL, $activationId, $saleId, null, null, 'Direct referral');
             } else {
                 self::pool('REFERRAL_UNPAID', Plan::REFERRAL);
             }
 
-            // 5) Generation Bonus ৳200 — generations 1..10 up the sponsor chain.
+            // Generation Bonus ৳200 — 10 sponsor generations. An inactive sponsor blocks
+            // every contribution above it; unpaid amounts stay in the company pool.
             $upline = Placement::sponsorUpline($userId, 10);
+            $blocked = false;
             foreach (Plan::GENERATION as $level => $amount) {
                 $target = $upline[$level - 1] ?? null;
-                if ($target !== null) {
+                if ($target !== null && !$blocked && !self::isActive($target)) $blocked = true;
+                if ($target !== null && !$blocked) {
                     self::ledger('GENERATION', $target, (float) $amount, $activationId, $saleId, null, $level, "Generation $level bonus");
+                    DB::run('UPDATE lo_sales SET generation_paid = generation_paid + ? WHERE id = ?', [$amount, $saleId]);
                 } else {
                     self::pool('GENERATION_UNPAID', (float) $amount);
                 }
             }
 
-            // 6) Rank & Reward pool ৳200 — accumulated, distributed by the rank engine.
+            // Rank & Reward ৳200 — separate pool, never funded from the matching reserve.
             self::pool('RANK', Plan::RANK_POOL);
 
-            // 7) Matching: propagate volume through both trees, build bills, pay selected.
-            self::propagateBinary($userId, $saleId, $activationId, $sponsorId);
-            self::propagateEnrollment($userId, $saleId, $activationId, $sponsorId);
+            // Matching: both trees produce bills; each beneficiary gets ONE event / ONE payout.
+            $paused = DB::val("SELECT v FROM lo_settings WHERE k = 'matching_paused'") === '1';
+            $candidates = [];
+            self::collectBinary($userId, $paused, $candidates);
+            self::collectEnrollment($userId, $sponsorId, $paused, $candidates);
+            foreach ($candidates as $beneficiaryId => $types) {
+                self::matchingEvent($beneficiaryId, $saleId, $activationId, $sponsorId, $types);
+            }
 
             DB::run('UPDATE lo_activations SET processed = 1, processed_at = NOW() WHERE id = ?', [$activationId]);
         });
     }
 
-    /** Binary tree: add 1 BV-carry up the placement chain; each upline may match. */
-    private static function propagateBinary(int $userId, int $saleId, int $activationId, ?int $sponsorId): void
+    /**
+     * Refund / cancellation / chargeback: history is never deleted. Every paid entry of
+     * the activation receives an opposite reversal entry; matching events are marked REVERSED.
+     */
+    public static function reverseActivation(int $activationId, string $status): void
+    {
+        DB::tx(function () use ($activationId, $status) {
+            $act = DB::one('SELECT * FROM lo_activations WHERE id = ? FOR UPDATE', [$activationId]);
+            if (!$act) throw new HttpError('Activation not found', 404);
+            DB::run('UPDATE lo_activations SET payment_status = ? WHERE id = ?', [$status, $activationId]);
+            if ((int) $act['processed'] !== 1) return;
+
+            $rows = DB::all("SELECT * FROM lo_ledger WHERE activation_id = ? AND status = 'PAID' AND amount > 0 AND ledger_type <> 'ADJUSTMENT' FOR UPDATE", [$activationId]);
+            foreach ($rows as $row) {
+                // Cashback reversal stays inside the cashback ledger; commissions go to the adjustment ledger.
+                $type = $row['ledger_type'] === 'CASHBACK' ? 'CASHBACK' : 'ADJUSTMENT';
+                DB::run(
+                    'INSERT IGNORE INTO lo_ledger (payout_code, user_id, ledger_type, amount, activation_id, sale_id, ref_id, level, note) VALUES (?,?,?,?,?,?,?,?,?)',
+                    ['REV-' . $row['id'], (int) $row['user_id'], $type, -(float) $row['amount'], $activationId, $row['sale_id'], (int) $row['id'], $row['level'], 'Reversal: ' . $row['ledger_type'] . " ($status)"]
+                );
+            }
+            DB::run("UPDATE lo_matching_events SET payout_status = 'REVERSED' WHERE activation_id = ? AND payout_status = 'PAID'", [$activationId]);
+            DB::run("UPDATE lo_sales SET status = 'REVERSED' WHERE activation_id = ?", [$activationId]);
+            DB::run('UPDATE lo_tree SET is_active = 0 WHERE user_id = ?', [(int) $act['user_id']]);
+        });
+    }
+
+    /** Binary tree: new volume walks up the placement chain; one pair per active upline. */
+    private static function collectBinary(int $userId, bool $paused, array &$candidates): void
     {
         foreach (Placement::binaryUpline($userId) as $step) {
             $up = DB::one('SELECT * FROM lo_tree WHERE user_id = ? FOR UPDATE', [$step['user_id']]);
-            if (!$up) continue;
+            if (!$up || !(int) $up['is_active']) continue; // inactive IDs hold/earn no eligible volume
             $col = $step['side'] === 'L' ? 'left_carry' : 'right_carry';
             DB::run("UPDATE lo_tree SET $col = $col + 1 WHERE user_id = ?", [$step['user_id']]);
+            if ($paused) continue; // volume carries; no new matching while paused
 
             $left = (float) $up['left_carry'] + ($step['side'] === 'L' ? 1 : 0);
             $right = (float) $up['right_carry'] + ($step['side'] === 'R' ? 1 : 0);
-            $pairs = (int) min($left, $right);
-            if ($pairs < 1 || !(int) $up['is_active']) continue;
-
-            // Consume matched volume — consumed volume is never reused.
-            DB::run(
-                'UPDATE lo_tree SET left_carry = left_carry - ?, right_carry = right_carry - ?, left_consumed = left_consumed + ?, right_consumed = right_consumed + ? WHERE user_id = ?',
-                [$pairs, $pairs, $pairs, $pairs, $step['user_id']]
-            );
-            for ($i = 0; $i < $pairs; $i++) {
-                self::matchingEvent($step['user_id'], $saleId, $activationId, $sponsorId, 'BINARY');
-            }
+            if (min($left, $right) < 1) continue;
+            // Consume exactly one pair for this event — consumed volume is never reused.
+            DB::run('UPDATE lo_tree SET left_carry = left_carry - 1, right_carry = right_carry - 1, left_consumed = left_consumed + 1, right_consumed = right_consumed + 1 WHERE user_id = ?', [$step['user_id']]);
+            $candidates[(int) $step['user_id']]['BINARY'] = true;
         }
     }
 
-    /** Enrollment tree: add carry per (upline, direct-leg) up the sponsor chain. */
-    private static function propagateEnrollment(int $userId, int $saleId, int $activationId, ?int $sponsorId): void
+    /** Enrollment tree: pairs the two largest eligible legs; an inactive sponsor blocks propagation. */
+    private static function collectEnrollment(int $userId, ?int $sponsorId, bool $paused, array &$candidates): void
     {
         $legUser = $userId;
         $cur = $sponsorId;
         $depth = 500;
         while ($cur !== null && $depth-- > 0) {
+            $up = DB::one('SELECT is_active, sponsor_id FROM lo_tree WHERE user_id = ? FOR UPDATE', [$cur]);
+            if (!$up || !(int) $up['is_active']) break; // inactive sponsor: nothing contributes upward
             DB::run(
                 'INSERT INTO lo_enroll_legs (upline_id, leg_user_id, carry) VALUES (?, ?, 1)
                  ON DUPLICATE KEY UPDATE carry = carry + 1',
                 [$cur, $legUser]
             );
-            $up = DB::one('SELECT t.is_active, t.sponsor_id FROM lo_tree t WHERE t.user_id = ? FOR UPDATE', [$cur]);
-            if (!$up) break;
-
-            // Match across this upline's legs: min carry over legs with carry > 0, need >= 2 legs.
-            $legs = DB::all('SELECT leg_user_id, carry FROM lo_enroll_legs WHERE upline_id = ? AND carry > 0 FOR UPDATE', [$cur]);
-            if (count($legs) >= 2 && (int) $up['is_active']) {
-                $pairs = min(array_column($legs, 'carry'));
-                for ($i = 0; $i < (int) $pairs; $i++) {
+            if (!$paused) {
+                $legs = DB::all('SELECT leg_user_id, carry FROM lo_enroll_legs WHERE upline_id = ? AND carry > 0 ORDER BY carry DESC, leg_user_id ASC LIMIT 2 FOR UPDATE', [$cur]);
+                if (count($legs) === 2) {
                     foreach ($legs as $leg) {
                         DB::run('UPDATE lo_enroll_legs SET carry = carry - 1, consumed = consumed + 1 WHERE upline_id = ? AND leg_user_id = ?', [$cur, $leg['leg_user_id']]);
                     }
-                    self::matchingEvent($cur, $saleId, $activationId, $sponsorId, 'ENROLLMENT');
+                    $candidates[$cur]['ENROLLMENT'] = true;
                 }
             }
             $legUser = $cur;
@@ -128,74 +152,70 @@ final class Commission
     }
 
     /**
-     * One matching event for a beneficiary: both bills are calculated, the larger
-     * eligible bill is selected, ONE payout is made — subject to the sale's 11-event
-     * counter, the ৳300 reserve hard limit, and the ৳5,000 daily cap.
+     * One matching event: enrollment and binary bills are both calculated, the larger
+     * eligible bill is selected, ONE payout = MIN(bill, schedule, remaining reserve, remaining daily cap).
      */
-    private static function matchingEvent(int $beneficiaryId, int $saleId, int $activationId, ?int $sponsorId, string $billType): void
+    private static function matchingEvent(int $beneficiaryId, int $saleId, int $activationId, ?int $sponsorId, array $types): void
     {
-        if (DB::val("SELECT v FROM lo_settings WHERE k = 'matching_paused'") === '1') return;
-
         $sale = DB::one('SELECT * FROM lo_sales WHERE id = ? FOR UPDATE', [$saleId]);
         if (!$sale || $sale['status'] !== 'OPEN') return;
         if ((int) $sale['matching_count'] >= Plan::MAX_MATCHING_EVENTS) {
             DB::run("UPDATE lo_sales SET status = 'EXHAUSTED' WHERE id = ?", [$saleId]);
             return;
         }
-
         $eventNo = (int) $sale['matching_count'] + 1;
-        $amount = Plan::matchingAmount($eventNo);
+        $schedule = Plan::matchingAmount($eventNo);
 
-        // Reserve hard limit: never pay more than what remains of the ৳300 reserve.
-        $remaining = (float) $sale['matching_reserve'] - (float) $sale['matching_paid'];
-        if ($amount > $remaining) $amount = $remaining;
-        if ($amount <= 0) {
-            DB::run("UPDATE lo_sales SET status = 'EXHAUSTED' WHERE id = ?", [$saleId]);
-            return;
-        }
+        $enrollmentBill = !empty($types['ENROLLMENT']) ? $schedule : 0.0;
+        $binaryBill = !empty($types['BINARY']) ? $schedule : 0.0;
+        $selectedType = $enrollmentBill >= $binaryBill ? 'ENROLLMENT' : 'BINARY';
+        $selected = max($enrollmentBill, $binaryBill);
+        if ($selected <= 0) return;
 
-        // Both bills are calculation results for the same event; one is selected.
-        DB::run('INSERT INTO lo_matching_bills (sale_id, beneficiary_id, bill_type, amount, status) VALUES (?, ?, ?, ?, ?)', [$saleId, $beneficiaryId, 'ENROLLMENT', $billType === 'ENROLLMENT' ? $amount : 0, $billType === 'ENROLLMENT' ? 'SELECTED' : 'CALCULATED']);
-        DB::run('INSERT INTO lo_matching_bills (sale_id, beneficiary_id, bill_type, amount, status) VALUES (?, ?, ?, ?, ?)', [$saleId, $beneficiaryId, 'BINARY', $billType === 'BINARY' ? $amount : 0, $billType === 'BINARY' ? 'SELECTED' : 'CALCULATED']);
-
-        // Daily cap ৳5,000 per active ID (matching only).
+        $reserveBefore = (float) $sale['matching_reserve'] - (float) $sale['matching_paid'];
         $today = date('Y-m-d');
         DB::run('INSERT IGNORE INTO lo_daily_caps (user_id, cap_date) VALUES (?, ?)', [$beneficiaryId, $today]);
-        $cap = DB::one('SELECT paid FROM lo_daily_caps WHERE user_id = ? AND cap_date = ? FOR UPDATE', [$beneficiaryId, $today]);
-        $dailyBefore = (float) $cap['paid'];
+        $dailyBefore = (float) DB::val('SELECT paid FROM lo_daily_caps WHERE user_id = ? AND cap_date = ? FOR UPDATE', [$beneficiaryId, $today]);
         $capLimit = (float) (DB::val("SELECT v FROM lo_settings WHERE k = 'daily_matching_cap'") ?: 5000);
-        $payout = min($amount, max(0.0, $capLimit - $dailyBefore));
+
+        $payout = round(max(0.0, min($selected, $schedule, $reserveBefore, $capLimit - $dailyBefore)), 6);
         $flushed = $payout <= 0;
 
-        $reserveAfter = (float) $sale['matching_paid'] + $amount;
+        foreach (['ENROLLMENT' => $enrollmentBill, 'BINARY' => $binaryBill] as $type => $bill) {
+            DB::run('INSERT INTO lo_matching_bills (sale_id, beneficiary_id, bill_type, amount, status) VALUES (?, ?, ?, ?, ?)',
+                [$saleId, $beneficiaryId, $type, $bill, $type === $selectedType ? 'SELECTED' : ($bill > 0 ? 'ELIGIBLE' : 'CALCULATED')]);
+        }
+
         $eventCode = self::code('ME');
+        $placementParent = DB::val('SELECT placement_parent_id FROM lo_tree WHERE user_id = ?', [$beneficiaryId]);
         DB::run(
             'INSERT INTO lo_matching_events
-             (event_code, sale_id, activation_id, beneficiary_id, sponsor_id, event_number,
+             (event_code, sale_id, activation_id, beneficiary_id, sponsor_id, placement_parent_id, event_number,
               enrollment_bill, binary_bill, selected_bill, selected_type, calculated_payout, actual_payout,
               reserve_before, reserve_after, daily_before, daily_after, payout_status, note)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             [
-                $eventCode, $saleId, $activationId, $beneficiaryId, $sponsorId, $eventNo,
-                $billType === 'ENROLLMENT' ? $amount : 0, $billType === 'BINARY' ? $amount : 0,
-                $amount, $billType, $amount, $flushed ? 0 : $payout,
-                (float) $sale['matching_paid'], $reserveAfter, $dailyBefore, $dailyBefore + ($flushed ? 0 : $payout),
+                $eventCode, $saleId, $activationId, $beneficiaryId, $sponsorId, $placementParent, $eventNo,
+                $enrollmentBill, $binaryBill, $selected, $selectedType, $schedule, $payout,
+                $reserveBefore, $reserveBefore - $payout, $dailyBefore, $dailyBefore + $payout,
                 $flushed ? 'FLUSHED' : 'PAID', $flushed ? 'Daily cap reached' : null,
             ]
         );
 
-        // The sale's counter advances on every event, paid or flushed — never reset by date.
-        DB::run('UPDATE lo_sales SET matching_count = matching_count + 1, matching_paid = matching_paid + ? WHERE id = ?', [$amount, $saleId]);
+        // Counter never resets by date; reserve is reduced by the ACTUAL payout only.
+        DB::run('UPDATE lo_sales SET matching_count = matching_count + 1, matching_paid = matching_paid + ? WHERE id = ?', [$payout, $saleId]);
         DB::run('UPDATE lo_tree SET lifetime_matchings = lifetime_matchings + 1 WHERE user_id = ?', [$beneficiaryId]);
 
         if (!$flushed) {
             DB::run('UPDATE lo_daily_caps SET paid = paid + ? WHERE user_id = ? AND cap_date = ?', [$payout, $beneficiaryId, $today]);
-            self::ledger('MATCHING', $beneficiaryId, $payout, $activationId, $saleId, null, null, "Matching #$eventNo ($billType)", $eventCode);
-        } else {
-            self::pool('MATCHING_BUFFER', $amount);
+            self::ledger('MATCHING', $beneficiaryId, $payout, $activationId, $saleId, null, $eventNo, "Matching #$eventNo ($selectedType)", $eventCode);
         }
-
         Rank::check($beneficiaryId);
+    }
+
+    private static function isActive(int $userId): bool
+    {
+        return (int) DB::val('SELECT is_active FROM lo_tree WHERE user_id = ?', [$userId]) === 1;
     }
 
     private static function ledger(string $type, int $userId, float $amount, ?int $activationId, ?int $saleId, ?int $refId, ?int $level, string $note, ?string $code = null): void
